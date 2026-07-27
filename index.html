@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>drift — embers</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #050304;
+    overflow: hidden;
+  }
+  canvas {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+  }
+  /* warm floor glow + vignette, painted over the field */
+  .veil {
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    background:
+      radial-gradient(120% 70% at 50% 118%, rgba(180, 74, 18, 0.20), rgba(120, 40, 8, 0.06) 45%, rgba(0,0,0,0) 70%),
+      radial-gradient(100% 100% at 50% 45%, rgba(0,0,0,0) 42%, rgba(0,0,0,0.55) 100%);
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="veil"></div>
+<script>
+(() => {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d', { alpha: false });
+
+  const calm = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  let W = 0, H = 0, dpr = 1;
+
+  // ---- ember sprites: soft copper halo, a few hue bands ------------------
+  function makeSprite(hue, size) {
+    const cv = document.createElement('canvas');
+    cv.width = cv.height = size;
+    const g = cv.getContext('2d');
+    const r = size / 2;
+    const grd = g.createRadialGradient(r, r, 0, r, r, r);
+    grd.addColorStop(0.00, 'rgba(255, 249, 238, 1)');
+    grd.addColorStop(0.09, `hsla(${hue + 20}, 100%, 84%, 0.92)`);
+    grd.addColorStop(0.24, `hsla(${hue + 6}, 100%, 62%, 0.42)`);
+    grd.addColorStop(0.48, `hsla(${hue - 4}, 100%, 47%, 0.13)`);
+    grd.addColorStop(0.76, `hsla(${hue - 10}, 100%, 38%, 0.03)`);
+    grd.addColorStop(1.00, `hsla(${hue - 12}, 100%, 34%, 0)`);
+    g.fillStyle = grd;
+    g.fillRect(0, 0, size, size);
+    return cv;
+  }
+
+  const HUES = [12, 19, 26, 33, 40, 47];
+  const halos = HUES.map(h => makeSprite(h, 96));
+  const cores = HUES.map(h => makeSprite(h + 14, 32));
+
+  // ---- flow field --------------------------------------------------------
+  // layered sines, slowly kneaded by time — cheap and smooth
+  function flow(x, y, t) {
+    const a =
+      Math.sin(x * 0.00170 + t * 0.150) * 1.05 +
+      Math.sin(y * 0.00240 - t * 0.115) * 0.95 +
+      Math.sin((x + y) * 0.00115 + t * 0.078) * 0.80 +
+      Math.sin((x - y * 0.6) * 0.00330 - t * 0.205) * 0.45;
+    return a * 1.25;
+  }
+
+  // ---- embers ------------------------------------------------------------
+  const embers = [];
+  let count = 0;
+
+  function seed(e, initial) {
+    e.x = Math.random() * W;
+    e.y = initial ? Math.random() * H : H + 20 + Math.random() * H * 0.35;
+    // a wide band of them born low, some drifting in from the sides
+    if (!initial && Math.random() < 0.18) {
+      e.x = Math.random() < 0.5 ? -30 : W + 30;
+      e.y = H * (0.25 + Math.random() * 0.75);
+    }
+    e.px = e.x;
+    e.py = e.y;
+    e.vx = (Math.random() - 0.5) * 0.35;
+    e.vy = -0.25 - Math.random() * 0.55;
+    e.life = 0;
+    e.span = 380 + Math.random() * 900;
+    if (initial) e.life = Math.random() * e.span * 0.7;
+    e.buoy = 0.020 + Math.random() * 0.055;
+    e.drag = 0.976 + Math.random() * 0.017;
+    e.hue = (Math.random() * HUES.length) | 0;
+    // a handful burn much brighter and bigger than the rest
+    const rare = Math.random();
+    e.size = rare > 0.985 ? 5.2 + Math.random() * 4.0
+           : rare > 0.86  ? 2.1 + Math.random() * 1.7
+           :                0.75 + Math.random() * 1.05;
+    e.bright = rare > 0.985 ? 1.0 : 0.34 + Math.random() * 0.5;
+    e.flick = Math.random() * 6.283;
+    e.flickRate = 0.06 + Math.random() * 0.22;
+    e.sway = 0.10 + Math.random() * 0.55;
+  }
+
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = '#050304';
+    ctx.fillRect(0, 0, W, H);
+
+    const want = Math.max(320, Math.min(1500, Math.round(W * H / 1050)));
+    if (want > count) {
+      for (let i = count; i < want; i++) {
+        const e = {};
+        seed(e, true);
+        embers.push(e);
+      }
+    } else {
+      embers.length = want;
+    }
+    count = want;
+  }
+
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ---- loop --------------------------------------------------------------
+  const speed = calm ? 0.35 : 1;
+  let t = 0;
+  let last = performance.now();
+
+  function frame(now) {
+    let dt = (now - last) / 16.667;
+    last = now;
+    if (!(dt > 0)) dt = 1;
+    if (dt > 3) dt = 3;
+    t += dt * 0.016 * speed;
+
+    // fade the previous frame — this is what stretches the streaks
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = 'rgba(5, 3, 4, 0.052)';
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.lineCap = 'round';
+
+    for (let i = 0; i < count; i++) {
+      const e = embers[i];
+
+      const ang = flow(e.x, e.y, t);
+      const f = 0.052 * speed;
+      e.vx += Math.cos(ang) * f * e.sway;
+      e.vy += Math.sin(ang) * f * 0.55;
+      e.vy -= e.buoy * speed;          // heat lift
+      e.vx += Math.sin(t * 0.31 + e.y * 0.0021) * 0.012 * speed;  // slow wind
+
+      e.vx *= e.drag;
+      e.vy *= e.drag;
+
+      e.px = e.x;
+      e.py = e.y;
+      e.x += e.vx * dt * 1.9;
+      e.y += e.vy * dt * 1.9;
+      e.life += dt;
+
+      // envelope: rise in, burn, dim out
+      const u = e.life / e.span;
+      let env = u < 0.10 ? u / 0.10 : (1 - u) / 0.90;
+      if (env < 0) env = 0;
+      env *= env * (3 - 2 * env);      // smoothstep
+
+      e.flick += e.flickRate * dt;
+      const flick = 0.72 + 0.28 * Math.sin(e.flick) * Math.sin(e.flick * 2.13 + 1.1);
+      const glow = e.bright * env * flick;
+
+      if (glow > 0.004) {
+        const h = e.hue;
+
+        // the copper streak trailing the head
+        const dx = e.x - e.px, dy = e.y - e.py;
+        const len = Math.sqrt(dx * dx + dy * dy);
+        if (len > 0.05) {
+          ctx.globalAlpha = Math.min(0.5, glow * 0.42);
+          ctx.strokeStyle = `hsl(${HUES[h] - 2}, 100%, ${44 + glow * 26}%)`;
+          ctx.lineWidth = Math.max(0.5, e.size * 0.62);
+          ctx.beginPath();
+          ctx.moveTo(e.px, e.py);
+          ctx.lineTo(e.x, e.y);
+          ctx.stroke();
+        }
+
+        // halo
+        const R = e.size * 5.4;
+        ctx.globalAlpha = Math.min(1, glow * 0.62);
+        ctx.drawImage(halos[h], e.x - R, e.y - R, R * 2, R * 2);
+
+        // bright head
+        const r = e.size * 1.35;
+        ctx.globalAlpha = Math.min(1, glow * 0.95);
+        ctx.drawImage(cores[h], e.x - r, e.y - r, r * 2, r * 2);
+      }
+
+      if (e.life > e.span || e.y < -60 || e.x < -80 || e.x > W + 80) seed(e, false);
+    }
+
+    ctx.globalAlpha = 1;
+    requestAnimationFrame(frame);
+  }
+
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
