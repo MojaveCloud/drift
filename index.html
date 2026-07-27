@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>drift</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #07060a;
+    overflow: hidden;
+  }
+  canvas {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+  }
+  /* warm falloff at the edges so the field feels lit from within */
+  .vignette {
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    background:
+      radial-gradient(120% 90% at 50% 45%, rgba(0,0,0,0) 40%, rgba(4,3,6,0.55) 78%, rgba(3,2,4,0.9) 100%);
+    mix-blend-mode: multiply;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="vignette"></div>
+<script>
+(function () {
+  'use strict';
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d', { alpha: false });
+
+  var BG = 'rgb(7, 6, 10)';
+  var TAU = Math.PI * 2;
+
+  /* ---------- value noise (3d, fbm) ---------- */
+
+  var perm = new Uint8Array(512);
+  (function () {
+    var p = new Uint8Array(256), i, j, t;
+    for (i = 0; i < 256; i++) p[i] = i;
+    var s = 20260727;
+    var rnd = function () { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; };
+    for (i = 255; i > 0; i--) {
+      j = (rnd() * (i + 1)) | 0;
+      t = p[i]; p[i] = p[j]; p[j] = t;
+    }
+    for (i = 0; i < 512; i++) perm[i] = p[i & 255];
+  })();
+
+  function hash(x, y, z) {
+    return perm[(perm[(perm[x & 255] + y) & 255] + z) & 255] * (1 / 255);
+  }
+
+  function fade(t) { return t * t * (3 - 2 * t); }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+
+  function noise3(x, y, z) {
+    var xi = Math.floor(x), yi = Math.floor(y), zi = Math.floor(z);
+    var xf = x - xi, yf = y - yi, zf = z - zi;
+    var u = fade(xf), v = fade(yf), w = fade(zf);
+
+    var c000 = hash(xi,     yi,     zi);
+    var c100 = hash(xi + 1, yi,     zi);
+    var c010 = hash(xi,     yi + 1, zi);
+    var c110 = hash(xi + 1, yi + 1, zi);
+    var c001 = hash(xi,     yi,     zi + 1);
+    var c101 = hash(xi + 1, yi,     zi + 1);
+    var c011 = hash(xi,     yi + 1, zi + 1);
+    var c111 = hash(xi + 1, yi + 1, zi + 1);
+
+    var x00 = lerp(c000, c100, u);
+    var x10 = lerp(c010, c110, u);
+    var x01 = lerp(c001, c101, u);
+    var x11 = lerp(c011, c111, u);
+
+    return lerp(lerp(x00, x10, v), lerp(x01, x11, v), w);
+  }
+
+  function fbm(x, y, z) {
+    var v = 0, a = 0.5, f = 1, i;
+    for (i = 0; i < 3; i++) {
+      v += a * noise3(x * f, y * f, z * f);
+      f *= 2.07;
+      a *= 0.5;
+    }
+    return v * 1.1428571; /* ~normalise 0..1 */
+  }
+
+  /* ---------- palette: sand -> copper, with rare highlights ---------- */
+
+  var PALETTE = [
+    { c: '190, 156, 104', w: 0.20 },  /* dry sand   */
+    { c: '224, 200, 158', w: 0.16 },  /* pale sand  */
+    { c: '205, 141, 79',  w: 0.18 },  /* warm ochre */
+    { c: '178,  92,  41', w: 0.20 },  /* copper     */
+    { c: '132,  58,  28', w: 0.14 },  /* ember      */
+    { c: '255, 238, 202', w: 0.12 }   /* highlight  */
+  ];
+  var ALPHAS = [
+    { a: 0.055, w: 1.6 },
+    { a: 0.10,  w: 0.85 },
+    { a: 0.17,  w: 0.55 }
+  ];
+
+  function pickWeighted(list) {
+    var total = 0, i;
+    for (i = 0; i < list.length; i++) total += list[i].w;
+    var r = Math.random() * total;
+    for (i = 0; i < list.length; i++) {
+      r -= list[i].w;
+      if (r <= 0) return i;
+    }
+    return list.length - 1;
+  }
+
+  /* ---------- glow sprite for the brightest motes ---------- */
+
+  var glow = document.createElement('canvas');
+  glow.width = glow.height = 64;
+  (function () {
+    var g = glow.getContext('2d');
+    var rg = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+    rg.addColorStop(0.00, 'rgba(255, 246, 220, 1)');
+    rg.addColorStop(0.18, 'rgba(255, 224, 170, 0.55)');
+    rg.addColorStop(0.45, 'rgba(214, 132, 62, 0.16)');
+    rg.addColorStop(1.00, 'rgba(180, 96, 40, 0)');
+    g.fillStyle = rg;
+    g.fillRect(0, 0, 64, 64);
+  })();
+
+  /* ---------- state ---------- */
+
+  var W = 0, H = 0, dpr = 1;
+  var particles = [], buckets = [], motes = [];
+  var FIELD_SCALE = 0.0016;
+  var frame = 0;
+  var pointer = { x: -9999, y: -9999, active: false };
+
+  function spawn(p) {
+    p.x = Math.random() * W;
+    p.y = Math.random() * H;
+    p.px = p.x;
+    p.py = p.y;
+    p.life = 90 + Math.random() * 320;
+    p.speed = 0.55 + Math.random() * 1.15;
+  }
+
+  function build() {
+    var area = W * H;
+    var count = Math.max(700, Math.min(2600, Math.round(area / 900)));
+    var i, ci, ai, p;
+
+    particles = [];
+    buckets = [];
+    for (i = 0; i < PALETTE.length * ALPHAS.length; i++) buckets.push([]);
+
+    for (i = 0; i < count; i++) {
+      ci = pickWeighted(PALETTE);
+      ai = pickWeighted(ALPHAS);
+      p = { ci: ci, ai: ai, x: 0, y: 0, px: 0, py: 0, life: 0, speed: 1 };
+      spawn(p);
+      p.life = Math.random() * 320;
+      particles.push(p);
+      buckets[ci * ALPHAS.length + ai].push(p);
+    }
+
+    motes = [];
+    var mcount = Math.max(18, Math.round(count * 0.022));
+    for (i = 0; i < mcount; i++) {
+      p = { x: 0, y: 0, px: 0, py: 0, life: 0, speed: 1,
+            size: 9 + Math.random() * 26, alpha: 0.12 + Math.random() * 0.3 };
+      spawn(p);
+      p.life = Math.random() * 400;
+      motes.push(p);
+    }
+  }
+
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = BG;
+    ctx.fillRect(0, 0, W, H);
+    build();
+  }
+
+  /* ---------- flow field ---------- */
+
+  function angleAt(x, y, t) {
+    var n = fbm(x * FIELD_SCALE, y * FIELD_SCALE, t);
+    /* a slowly turning base direction keeps everything drifting as one body */
+    var base = Math.sin(t * 6.0) * 0.6 + 0.35;
+    return (n - 0.5) * TAU * 2.1 + base;
+  }
+
+  function advance(p, t) {
+    var a = angleAt(p.x, p.y, t);
+    var vx = Math.cos(a) * p.speed;
+    var vy = Math.sin(a) * p.speed;
+
+    if (pointer.active) {
+      var dx = p.x - pointer.x, dy = p.y - pointer.y;
+      var d2 = dx * dx + dy * dy;
+      if (d2 < 62500 && d2 > 1) {
+        var d = Math.sqrt(d2);
+        var f = (1 - d / 250) * 1.5;
+        /* swirl around the cursor rather than fleeing it */
+        vx += (-dy / d) * f;
+        vy += (dx / d) * f;
+      }
+    }
+
+    p.px = p.x;
+    p.py = p.y;
+    p.x += vx;
+    p.y += vy;
+    p.life -= 1;
+
+    if (p.life <= 0 || p.x < -40 || p.x > W + 40 || p.y < -40 || p.y > H + 40) {
+      spawn(p);
+    }
+  }
+
+  /* ---------- render ---------- */
+
+  function draw() {
+    frame++;
+    var t = frame * 0.00022;
+
+    /* long, soft trails */
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = 'rgba(7, 6, 10, 0.042)';
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.lineCap = 'round';
+
+    var b, i, list, p;
+    for (b = 0; b < buckets.length; b++) {
+      list = buckets[b];
+      if (!list.length) continue;
+      var ci = (b / ALPHAS.length) | 0;
+      var ai = b % ALPHAS.length;
+
+      ctx.strokeStyle = 'rgba(' + PALETTE[ci].c + ', ' + ALPHAS[ai].a + ')';
+      ctx.lineWidth = ALPHAS[ai].w;
+      ctx.beginPath();
+      for (i = 0; i < list.length; i++) {
+        p = list[i];
+        advance(p, t);
+        if (p.px === p.x && p.py === p.y) continue;
+        ctx.moveTo(p.px, p.py);
+        ctx.lineTo(p.x, p.y);
+      }
+      ctx.stroke();
+    }
+
+    /* the few bright ones */
+    for (i = 0; i < motes.length; i++) {
+      p = motes[i];
+      advance(p, t);
+      var pulse = 0.65 + 0.35 * Math.sin(frame * 0.017 + i * 1.7);
+      ctx.globalAlpha = p.alpha * pulse;
+      ctx.drawImage(glow, p.x - p.size * 0.5, p.y - p.size * 0.5, p.size, p.size);
+    }
+    ctx.globalAlpha = 1;
+
+    requestAnimationFrame(draw);
+  }
+
+  /* ---------- events ---------- */
+
+  window.addEventListener('resize', resize);
+  window.addEventListener('pointermove', function (e) {
+    pointer.x = e.clientX;
+    pointer.y = e.clientY;
+    pointer.active = true;
+  });
+  window.addEventListener('pointerleave', function () { pointer.active = false; });
+
+  resize();
+  requestAnimationFrame(draw);
+})();
+</script>
+</body>
+</html>
