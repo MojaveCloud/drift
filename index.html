@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>drift</title>
+<meta name="description" content="Luminous flow-field particles drifting over near-black.">
+<style>
+  :root { --bg: #07060a; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; background: var(--bg); }
+  body {
+    overflow: hidden;
+    font: 400 11px/1 ui-sans-serif, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+    letter-spacing: .28em;
+    color: #d7b98c;
+    -webkit-font-smoothing: antialiased;
+    cursor: crosshair;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  .overlay { position: fixed; inset: 0; pointer-events: none; }
+  /* vignette — pulls the eye to the centre and deepens the corners */
+  .vignette {
+    background:
+      radial-gradient(120% 90% at 50% 46%, rgba(0,0,0,0) 42%, rgba(0,0,0,.55) 78%, rgba(0,0,0,.86) 100%);
+    mix-blend-mode: multiply;
+  }
+  /* a breath of warmth low in the frame */
+  .warmth {
+    background:
+      radial-gradient(70% 55% at 50% 108%, rgba(184,102,42,.16), rgba(0,0,0,0) 70%);
+    mix-blend-mode: screen;
+  }
+  /* fine grain, keeps the gradients from banding */
+  .grain {
+    opacity: .05;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3' stitchTiles='stitch'/><feColorMatrix type='saturate' values='0'/></filter><rect width='160' height='160' filter='url(%23n)'/></svg>");
+  }
+  .mark {
+    position: fixed;
+    left: max(22px, env(safe-area-inset-left));
+    bottom: max(20px, env(safe-area-inset-bottom));
+    text-transform: uppercase;
+    opacity: .34;
+    user-select: none;
+    pointer-events: none;
+    mix-blend-mode: screen;
+  }
+  @media (prefers-reduced-motion: reduce) { .mark { opacity: .22; } }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="overlay vignette"></div>
+<div class="overlay warmth"></div>
+<div class="overlay grain"></div>
+<div class="mark">drift</div>
+<script>
+(() => {
+  'use strict';
+
+  /* ---------- seeded rng ---------- */
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      let t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+
+  /* ---------- 3d simplex noise ---------- */
+  const GRAD3 = new Int8Array([
+    1,1,0, -1,1,0, 1,-1,0, -1,-1,0,
+    1,0,1, -1,0,1, 1,0,-1, -1,0,-1,
+    0,1,1, 0,-1,1, 0,1,-1, 0,-1,-1
+  ]);
+
+  function makeNoise(seed) {
+    const rnd = mulberry32(seed);
+    const p = new Uint8Array(256);
+    for (let i = 0; i < 256; i++) p[i] = i;
+    for (let i = 255; i > 0; i--) {
+      const j = (rnd() * (i + 1)) | 0;
+      const t = p[i]; p[i] = p[j]; p[j] = t;
+    }
+    const perm = new Uint8Array(512);
+    const permMod12 = new Uint8Array(512);
+    for (let i = 0; i < 512; i++) {
+      perm[i] = p[i & 255];
+      permMod12[i] = perm[i] % 12;
+    }
+
+    const F3 = 1 / 3, G3 = 1 / 6;
+
+    return function noise3(xin, yin, zin) {
+      const s = (xin + yin + zin) * F3;
+      const i = Math.floor(xin + s), j = Math.floor(yin + s), k = Math.floor(zin + s);
+      const t0f = (i + j + k) * G3;
+      const x0 = xin - (i - t0f), y0 = yin - (j - t0f), z0 = zin - (k - t0f);
+
+      let i1, j1, k1, i2, j2, k2;
+      if (x0 >= y0) {
+        if (y0 >= z0)      { i1=1; j1=0; k1=0; i2=1; j2=1; k2=0; }
+        else if (x0 >= z0) { i1=1; j1=0; k1=0; i2=1; j2=0; k2=1; }
+        else               { i1=0; j1=0; k1=1; i2=1; j2=0; k2=1; }
+      } else {
+        if (y0 < z0)       { i1=0; j1=0; k1=1; i2=0; j2=1; k2=1; }
+        else if (x0 < z0)  { i1=0; j1=1; k1=0; i2=0; j2=1; k2=1; }
+        else               { i1=0; j1=1; k1=0; i2=1; j2=1; k2=0; }
+      }
+
+      const x1 = x0 - i1 + G3,     y1 = y0 - j1 + G3,     z1 = z0 - k1 + G3;
+      const x2 = x0 - i2 + 2 * G3, y2 = y0 - j2 + 2 * G3, z2 = z0 - k2 + 2 * G3;
+      const x3 = x0 - 1 + 3 * G3,  y3 = y0 - 1 + 3 * G3,  z3 = z0 - 1 + 3 * G3;
+
+      const ii = i & 255, jj = j & 255, kk = k & 255;
+      const gi0 = permMod12[ii      + perm[jj      + perm[kk    ]]] * 3;
+      const gi1 = permMod12[ii + i1 + perm[jj + j1 + perm[kk+k1]]] * 3;
+      const gi2 = permMod12[ii + i2 + perm[jj + j2 + perm[kk+k2]]] * 3;
+      const gi3 = permMod12[ii + 1  + perm[jj + 1  + perm[kk+1 ]]] * 3;
+
+      let n = 0, t;
+      t = 0.6 - x0*x0 - y0*y0 - z0*z0;
+      if (t > 0) { t *= t; n += t * t * (GRAD3[gi0]*x0 + GRAD3[gi0+1]*y0 + GRAD3[gi0+2]*z0); }
+      t = 0.6 - x1*x1 - y1*y1 - z1*z1;
+      if (t > 0) { t *= t; n += t * t * (GRAD3[gi1]*x1 + GRAD3[gi1+1]*y1 + GRAD3[gi1+2]*z1); }
+      t = 0.6 - x2*x2 - y2*y2 - z2*z2;
+      if (t > 0) { t *= t; n += t * t * (GRAD3[gi2]*x2 + GRAD3[gi2+1]*y2 + GRAD3[gi2+2]*z2); }
+      t = 0.6 - x3*x3 - y3*y3 - z3*z3;
+      if (t > 0) { t *= t; n += t * t * (GRAD3[gi3]*x3 + GRAD3[gi3+1]*y3 + GRAD3[gi3+2]*z3); }
+      return 32 * n;
+    };
+  }
+
+  /* ---------- palette: shadowed umber → copper → sand → highlight ---------- */
+  const STOPS = [
+    [0.00, 62,  32,  18],
+    [0.26, 158, 76,  30],
+    [0.50, 199, 118, 54],
+    [0.72, 213, 172, 114],
+    [0.88, 240, 213, 165],
+    [1.00, 255, 245, 218]
+  ];
+
+  function ramp(t) {
+    t = t < 0 ? 0 : t > 1 ? 1 : t;
+    for (let i = 1; i < STOPS.length; i++) {
+      if (t <= STOPS[i][0]) {
+        const a = STOPS[i - 1], b = STOPS[i];
+        const f = (t - a[0]) / (b[0] - a[0]);
+        return [
+          a[1] + (b[1] - a[1]) * f,
+          a[2] + (b[2] - a[2]) * f,
+          a[3] + (b[3] - a[3]) * f
+        ];
+      }
+    }
+    const l = STOPS[STOPS.length - 1];
+    return [l[1], l[2], l[3]];
+  }
+
+  /* ---------- setup ---------- */
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d', { alpha: false });
+  const calm = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  const BG = 'rgb(7,6,10)';
+  const COLORS = 20;                       // colour buckets along the ramp
+  const ALPHAS = [0.045, 0.085, 0.135, 0.21];
+  const WIDTHS = [0.55, 0.75, 1.0, 1.35];
+  const BUCKETS = COLORS * ALPHAS.length;
+
+  // pre-baked stroke styles, one per (colour, alpha) pair — lets us stroke
+  // thousands of segments in ~80 draw calls instead of one call each
+  const STYLES = new Array(BUCKETS);
+  for (let c = 0; c < COLORS; c++) {
+    const [r, g, b] = ramp(c / (COLORS - 1)).map(Math.round);
+    for (let a = 0; a < ALPHAS.length; a++) {
+      STYLES[c * ALPHAS.length + a] = 'rgba(' + r + ',' + g + ',' + b + ',' + ALPHAS[a] + ')';
+    }
+  }
+
+  // pre-rendered glow sprites for the few bright embers
+  function glowSprite(r, g, b) {
+    const s = 64, off = document.createElement('canvas');
+    off.width = off.height = s;
+    const o = off.getContext('2d');
+    const grd = o.createRadialGradient(s / 2, s / 2, 0, s / 2, s / 2, s / 2);
+    grd.addColorStop(0,   'rgba(' + r + ',' + g + ',' + b + ',1)');
+    grd.addColorStop(0.28,'rgba(' + r + ',' + g + ',' + b + ',0.34)');
+    grd.addColorStop(1,   'rgba(' + r + ',' + g + ',' + b + ',0)');
+    o.fillStyle = grd;
+    o.fillRect(0, 0, s, s);
+    return off;
+  }
+  const SPRITES = [
+    glowSprite(255, 240, 208),
+    glowSprite(232, 168, 96),
+    glowSprite(196, 108, 48)
+  ];
+
+  let W = 0, H = 0, dpr = 1;
+  let particles = [];
+  let noise = makeNoise(1337);
+  let zOff = 0, drift = 0;
+
+  const pointer = { x: -9999, y: -9999, active: false };
+
+  const SCALE_A = 0.0016;   // large, slow structure
+  const SCALE_B = 0.0043;   // finer curl on top
+  const TAU = Math.PI * 2;
+
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = Math.max(1, Math.round(W * dpr));
+    canvas.height = Math.max(1, Math.round(H * dpr));
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = BG;
+    ctx.fillRect(0, 0, W, H);
+    ctx.lineCap = 'round';
+
+    const target = Math.min(calm ? 1200 : 2800, Math.round(W * H / (calm ? 900 : 520)));
+    if (particles.length > target) particles.length = target;
+    while (particles.length < target) particles.push(spawn({}, true));
+  }
+
+  function spawn(p, fresh) {
+    p.x = Math.random() * W;
+    p.y = Math.random() * H;
+    p.px = p.x;
+    p.py = p.y;
+    p.life = fresh ? Math.random() * 6 : 0;
+    p.max = 4 + Math.random() * 7;
+    // colour biased low — copper dominates, sand and highlights are the accent
+    const r = Math.random();
+    p.tint = r * r * 0.82 + Math.random() * 0.24;
+    p.speed = 0.7 + Math.random() * 0.75;
+    p.glow = Math.random() < 0.016 ? (Math.random() * 3) | 0 : -1;
+    return p;
+  }
+
+  /* ---------- flow field ---------- */
+  function angleAt(x, y, z) {
+    const a = noise(x * SCALE_A, y * SCALE_A, z);
+    const b = noise(x * SCALE_B + 41.7, y * SCALE_B - 18.3, z * 0.6 + 9.1);
+    return a * TAU * 1.35 + b * 0.85 + drift;
+  }
+
+  /* ---------- frame ---------- */
+  const segX0 = [], segY0 = [], segX1 = [], segY1 = [];
+  for (let i = 0; i < BUCKETS; i++) { segX0.push([]); segY0.push([]); segX1.push([]); segY1.push([]); }
+
+  let last = 0;
+
+  function frame(now) {
+    requestAnimationFrame(frame);
+    if (!last) last = now;
+    let dt = (now - last) / 1000;
+    last = now;
+    if (dt > 0.05) dt = 0.05;
+
+    const speedScale = calm ? 0.4 : 1;
+    zOff += dt * 0.028 * speedScale;
+    drift += dt * 0.012 * speedScale;
+
+    // veil the previous frame rather than clearing it — this is the trail
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = 'rgba(7,6,10,0.052)';
+    ctx.fillRect(0, 0, W, H);
+
+    for (let i = 0; i < BUCKETS; i++) {
+      segX0[i].length = 0; segY0[i].length = 0; segX1[i].length = 0; segY1[i].length = 0;
+    }
+
+    ctx.globalCompositeOperation = 'lighter';
+
+    const base = 46 * speedScale;
+    const embers = [];
+
+    for (let i = 0; i < particles.length; i++) {
+      const p = particles[i];
+      p.life += dt;
+
+      let ang = angleAt(p.x, p.y, zOff);
+
+      // the pointer stirs the field it passes through
+      if (pointer.active) {
+        const dx = p.x - pointer.x, dy = p.y - pointer.y;
+        const d2 = dx * dx + dy * dy;
+        if (d2 < 62500) {
+          const f = 1 - Math.sqrt(d2) / 250;
+          ang += f * f * 2.6;
+        }
+      }
+
+      const v = base * p.speed;
+      p.px = p.x; p.py = p.y;
+      p.x += Math.cos(ang) * v * dt;
+      p.y += Math.sin(ang) * v * dt;
+
+      if (p.life > p.max || p.x < -30 || p.x > W + 30 || p.y < -30 || p.y > H + 30) {
+        spawn(p, false);
+        continue;
+      }
+
+      // energy fades in and out over the particle's life
+      const lf = p.life / p.max;
+      const fade = lf < 0.14 ? lf / 0.14 : lf > 0.72 ? (1 - lf) / 0.28 : 1;
+      const energy = fade * (0.45 + p.speed * 0.55);
+
+      if (p.glow >= 0) {
+        embers.push(p, energy);
+        continue;
+      }
+
+      let ai = (energy * ALPHAS.length) | 0;
+      if (ai > ALPHAS.length - 1) ai = ALPHAS.length - 1;
+      if (ai < 0) ai = 0;
+
+      // faster, longer-lived particles ride brighter along the ramp
+      let ci = ((p.tint * 0.78 + energy * 0.3) * (COLORS - 1) + 0.5) | 0;
+      if (ci > COLORS - 1) ci = COLORS - 1;
+      if (ci < 0) ci = 0;
+
+      const b = ci * ALPHAS.length + ai;
+      segX0[b].push(p.px); segY0[b].push(p.py);
+      segX1[b].push(p.x);  segY1[b].push(p.y);
+    }
+
+    // one path per bucket
+    for (let b = 0; b < BUCKETS; b++) {
+      const xs = segX0[b];
+      if (xs.length === 0) continue;
+      const ys = segY0[b], xe = segX1[b], ye = segY1[b];
+      ctx.strokeStyle = STYLES[b];
+      ctx.lineWidth = WIDTHS[b % ALPHAS.length];
+      ctx.beginPath();
+      for (let k = 0; k < xs.length; k++) {
+        ctx.moveTo(xs[k], ys[k]);
+        ctx.lineTo(xe[k], ye[k]);
+      }
+      ctx.stroke();
+    }
+
+    // the bright ones, last and on top
+    for (let e = 0; e < embers.length; e += 2) {
+      const p = embers[e], energy = embers[e + 1];
+      const spr = SPRITES[p.glow];
+      const size = 14 + energy * 30;
+      ctx.globalAlpha = 0.1 + energy * 0.3;
+      ctx.drawImage(spr, p.x - size / 2, p.y - size / 2, size, size);
+      ctx.globalAlpha = 1;
+      ctx.strokeStyle = 'rgba(255,246,224,0.5)';
+      ctx.lineWidth = 1.1;
+      ctx.beginPath();
+      ctx.moveTo(p.px, p.py);
+      ctx.lineTo(p.x, p.y);
+      ctx.stroke();
+    }
+  }
+
+  /* ---------- input ---------- */
+  function movePointer(x, y) { pointer.x = x; pointer.y = y; pointer.active = true; }
+
+  window.addEventListener('pointermove', e => movePointer(e.clientX, e.clientY), { passive: true });
+  window.addEventListener('pointerleave', () => { pointer.active = false; }, { passive: true });
+  window.addEventListener('pointerdown', e => {
+    movePointer(e.clientX, e.clientY);
+    noise = makeNoise((Math.random() * 1e9) | 0);   // reseed: a whole new weather
+  }, { passive: true });
+
+  let rt = 0;
+  window.addEventListener('resize', () => {
+    clearTimeout(rt);
+    rt = setTimeout(resize, 140);
+  });
+
+  resize();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
